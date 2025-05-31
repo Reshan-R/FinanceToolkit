@@ -1,0 +1,317 @@
+# Install and load necessary packages
+# install.packages(c("tidyverse", "lubridate", "TTR", "xts", "quantmod", "PerformanceAnalytics", "ggplot2"))
+library(tidyverse)
+library(lubridate)
+library(TTR) # For SMA and other technical indicators
+library(xts) # For time series manipulation
+library(quantmod) # For basic financial data functions (useful but not strictly necessary for this data)
+library(PerformanceAnalytics) # For performance metrics
+library(ggplot2)
+
+# --- Configuration ---
+DATA_DIR <- 'pricedata' # Assuming CSV files are in a 'pricedata' subdirectory
+OUTPUT_DIR <- 'backtest_results_R'
+if (!dir.exists(OUTPUT_DIR)) {
+  dir.create(OUTPUT_DIR)
+}
+
+TARGET_ASSET <- 'BTC' # Or 'ETH', 'WBTC', etc. - choose one to backtest initially
+
+SHORT_SMA_PERIOD <- 50
+LONG_SMA_PERIOD <- 200
+VOLATILITY_LOOKBACK <- 24 * 7 # 7 days of hourly data for volatility
+VOLATILITY_THRESHOLD_PERCENTILE <- 75 # Only trade if volatility is below this percentile
+STOP_LOSS_PERCENT <- 0.05 # 5% trailing stop loss
+
+INITIAL_CAPITAL <- 10000 # USD
+TRANSACTION_FEE_PERCENT <- 0.001 # 0.1% per trade (buy and sell)
+
+# --- 1. Load and Preprocess Data ---
+load_and_preprocess_data <- function(data_dir, target_asset) {
+  csv_files <- list.files(data_dir, pattern = "\\.csv$", full.names = TRUE)
+  all_prices_list <- list()
+
+  # Mapping of addresses to project names (from the PDF) [cite: 1, 16]
+  project_mapping <- tribble( # [cite: 1]
+    ~address, ~name,
+    "0x95aD61b0a150d79219dCF64E1E6Cc01f0B64C4cE", "SHIB",
+    "0x1f9840a85d5aF5bf1D1762F925BDADdC4201F984", "UNI",
+    "0x514910771AF9Ca656af840dff83E8264EcF986CA", "LINK",
+    "0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599", "WBTC",
+    "0x7D1AfA7B718fb893dB30A3aBc0Cfc608AaCfeBB0", "MATIC",
+    "0xd850942ef8811f2a866692a623011bde52a462c1", "VET",
+    "0xa0b73e1ff0b80914ab6fe0444e65848c4c34450b", "CRO",
+    "0x0f5d2fb29fb7d3cfee444a200298f468908cc942", "MANA",
+    "0xc944e90c64b2c07662a292be6244bdf05cda44a7", "GRT",
+    "0x7Fc66500c84A76Ad7e9c93437bFc5Ac33E2DDaE9", "AAVE",
+    "0x2af5d2ad76741191d15dfe7bf6ac92d4bd912ca3", "LEO",
+    "0x9f8f72aa9304c8b593d555f12ef6589cc3a579a2", "MKR",
+    "0x3506424f91fd33084466f402d5d97f05f8e3b4af", "CHZ",
+    "0xf629cbd94d3791c9250152bd8dfbdf380e2a3b9c", "ENJ",
+    "0xff20817765cb7f73d4bde2e66e067e58d11095c2", "AMP",
+    "0x3845badAde8e6dFF049820680d1F14bD3903a5d0", "SAND",
+    "0xd26114cd6ee289accf82350c8d8487fedb8a0c07", "OMG",
+    "0xc00e94cb662c3520282e6f5717214004a7f26888", "COMP",
+    "0xbbbbca6a901c926f240b89eacb641d8aec7aeafd", "LRC",
+    "0xD533a949740bb3306d119CC777fa900bA034cd52", "CRV",
+    "bitcoin", "BTC",
+    "ethereum", "ETH",
+    "solana", "SOL"
+  )
+
+  for (file_path in csv_files) {
+    file_name <- basename(file_path)
+    # Extract project name from filename (e.g., hourly_prices_bitcoin.csv -> bitcoin) [cite: 1]
+    project_name_from_file <- gsub("hourly_prices_(.*)\\.csv", "\\1", file_name)
+
+    # Determine the project symbol using the mapping
+    project_symbol <- project_mapping$name[match(project_name_from_file, tolower(project_mapping$address))]
+    if (is.na(project_symbol)) { # If not found by address, check by name
+      project_symbol <- project_mapping$name[match(project_name_from_file, tolower(project_mapping$name))]
+    }
+    if (is.na(project_symbol)) { # Fallback for BTC, ETH, SOL that are directly named in files
+      project_symbol <- project_name_from_file
+      if (tolower(project_symbol) == "bitcoin") project_symbol <- "BTC"
+      if (tolower(project_symbol) == "ethereum") project_symbol <- "ETH"
+      if (tolower(project_symbol) == "solana") project_symbol <- "SOL"
+    }
+
+    if (project_symbol == target_asset) {
+      df <- read_csv(file_path) %>%
+        mutate(
+          hour_timestamp = as_datetime(hour_timestamp),
+          project = project_symbol
+        ) %>%
+        rename(close = close_price) %>% # Standardize column name
+        select(hour_timestamp, close, project) %>%
+        arrange(hour_timestamp)
+      all_prices_list[[target_asset]] <- df
+      break # Found the target asset, no need to read other files
+    }
+  }
+
+  if (length(all_prices_list) == 0) {
+    stop(paste0("No data found for ", target_asset, " in ", data_dir, ". Ensure filenames match the expected pattern (e.g., hourly_prices_bitcoin.csv for BTC) and column 'close_price' exists."))
+  }
+
+  return(all_prices_list[[target_asset]])
+}
+
+# --- 2. Implement Strategy Logic ---
+implement_strategy <- function(df, short_window, long_window, volatility_lookback, volatility_percentile) {
+  # Calculate SMAs
+  df$SMA_Short <- SMA(df$close, n = short_window)
+  df$SMA_Long <- SMA(df$close, n = long_window)
+
+  # Calculate hourly returns for volatility
+  df$Returns <- c(NA, diff(log(df$close))) # Log returns for volatility calculation
+  df$Volatility <- rollapply(df$Returns, width = volatility_lookback, FUN = sd, fill = NA, align = "right")
+
+  # Determine volatility threshold
+  valid_volatility <- df$Volatility[!is.na(df$Volatility)]
+  if (length(valid_volatility) > 0) {
+    volatility_threshold <- quantile(valid_volatility, probs = volatility_percentile / 100, na.rm = TRUE)
+  } else {
+    volatility_threshold <- Inf # If no valid volatility, allow all trades
+  }
+
+  df$Signal <- 0 # 0: No position, 1: Long position
+  df$Trade_Action <- 0 # 0: No action, 1: Buy, -1: Sell
+
+  # Generate initial signals (based on SMA crossover)
+  # Buy when SMA_Short crosses above SMA_Long AND volatility is low
+  # Lagging SMA_Short > SMA_Long to avoid look-ahead bias and ensure crossover
+  df$SMA_Crossover <- df$SMA_Short > df$SMA_Long
+  df$Prev_SMA_Crossover <- lag(df$SMA_Crossover, 1)
+
+  # Buy signal: (Previous crossover was FALSE and current is TRUE) AND Volatility is below threshold
+  df$Trade_Action[which(df$SMA_Crossover == TRUE & df$Prev_SMA_Crossover == FALSE & df$Volatility < volatility_threshold)] <- 1
+
+  # Sell signal: (Previous crossover was TRUE and current is FALSE)
+  df$Trade_Action[which(df$SMA_Crossover == FALSE & df$Prev_SMA_Crossover == TRUE)] <- -1
+
+  return(list(df_strategy = df, volatility_threshold = volatility_threshold))
+}
+
+# --- 3. Backtest Simulation ---
+run_backtest <- function(df_strategy, initial_capital, transaction_fee_percent, stop_loss_percent) {
+  portfolio <- data.frame(
+    hour_timestamp = df_strategy$hour_timestamp,
+    cash = NA,
+    holdings = NA,
+    total = NA,
+    returns = 0.0,
+    position = 0 # 0: out, 1: in
+  )
+  portfolio$cash[1] <- initial_capital
+  portfolio$holdings[1] <- 0
+  portfolio$total[1] <- initial_capital
+
+  current_holding_price <- 0
+  peak_price_since_entry <- 0
+
+  # Loop through the data
+  for (i in 2:nrow(df_strategy)) {
+    current_price <- df_strategy$close[i]
+
+    # Carry over previous state
+    portfolio$cash[i] <- portfolio$cash[i-1]
+    portfolio$holdings[i] <- portfolio$holdings[i-1]
+    portfolio$position[i] <- portfolio$position[i-1]
+
+    # Handle existing position updates for trailing stop loss
+    if (portfolio$position[i] == 1) { # If currently in a long position
+      peak_price_since_entry <- max(peak_price_since_entry, current_price, na.rm = TRUE)
+      stop_loss_level <- peak_price_since_entry * (1 - stop_loss_percent)
+
+      if (!is.na(current_price) && current_price < stop_loss_level) {
+        # Sell due to trailing stop loss
+        cash_from_sale <- portfolio$holdings[i-1] * current_price * (1 - transaction_fee_percent)
+        portfolio$cash[i] <- cash_from_sale
+        portfolio$holdings[i] <- 0
+        portfolio$position[i] <- 0
+        df_strategy$Trade_Action[i] <- -1 # Mark as a forced sell
+        cat(paste0("SELL (Stop Loss): ", format(df_strategy$hour_timestamp[i], "%Y-%m-%d %H:%M"), " - Price: ", round(current_price, 2), "\n"))
+        peak_price_since_entry <- 0 # Reset for next position
+      }
+    }
+
+    # Check for new signals
+    if (df_strategy$Trade_Action[i] == 1) { # Buy signal
+      if (portfolio$position[i] == 0 && !is.na(current_price) && portfolio$cash[i] > 0) { # If not already in a position and has cash
+        units_to_buy <- portfolio$cash[i] / current_price * (1 - transaction_fee_percent)
+        portfolio$holdings[i] <- units_to_buy
+        portfolio$cash[i] <- 0
+        portfolio$position[i] <- 1
+        current_holding_price <- current_price
+        peak_price_since_entry <- current_price # Initialize peak for trailing stop
+        cat(paste0("BUY: ", format(df_strategy$hour_timestamp[i], "%Y-%m-%d %H:%M"), " - Price: ", round(current_price, 2), "\n"))
+      }
+    } else if (df_strategy$Trade_Action[i] == -1) { # Sell signal (from SMA crossover)
+      if (portfolio$position[i] == 1 && !is.na(current_price) && portfolio$holdings[i] > 0) { # If currently in a long position
+        cash_from_sale <- portfolio$holdings[i-1] * current_price * (1 - transaction_fee_percent)
+        portfolio$cash[i] <- cash_from_sale
+        portfolio$holdings[i] <- 0
+        portfolio$position[i] <- 0
+        cat(paste0("SELL (Crossover): ", format(df_strategy$hour_timestamp[i], "%Y-%m-%d %H:%M"), " - Price: ", round(current_price, 2), "\n"))
+        peak_price_since_entry <- 0 # Reset for next position
+      }
+    }
+
+    # Update total portfolio value
+    portfolio$total[i] <- portfolio$cash[i] + portfolio$holdings[i] * current_price
+
+    # Calculate hourly returns (based on total portfolio value)
+    if (i > 1) {
+      portfolio$returns[i] <- (portfolio$total[i] / portfolio$total[i-1]) - 1
+    }
+  }
+
+  return(portfolio)
+}
+
+# --- 4. Analyze Results ---
+analyze_results <- function(portfolio, df_strategy, initial_capital, volatility_threshold, target_asset) {
+  final_capital <- tail(portfolio$total, 1)
+  total_return <- (final_capital - initial_capital) / initial_capital * 100
+
+  # Create an xts object for PerformanceAnalytics package
+  portfolio_returns_xts <- xts(portfolio$returns, order.by = portfolio$hour_timestamp)
+  # Filter out NA and 0 returns that might skew results from non-trading periods at start
+  portfolio_returns_xts <- portfolio_returns_xts[portfolio_returns_xts != 0 & !is.na(portfolio_returns_xts)]
+
+  # Annualized Return (assuming hourly data and 365*24 hours in a "trading year")
+  annualized_return_val <- Return.annualized(portfolio_returns_xts, scale = 365 * 24) * 100
+  max_drawdown_val <- maxDrawdown(portfolio_returns_xts) * 100
+  sharpe_ratio_val <- SharpeRatio.annualized(portfolio_returns_xts, Rf = 0, scale = 365 * 24)
+
+  # Calculate buy and hold return
+  buy_and_hold_return <- (tail(df_strategy$close, 1) / head(df_strategy$close, 1) - 1) * 100
+
+  cat("\n--- Backtest Results ---\n")
+  cat(paste0("Target Asset: ", target_asset, "\n"))
+  cat(paste0("Initial Capital: $", formatC(initial_capital, format = "f", digits = 2, big.mark = ","), "\n"))
+  cat(paste0("Final Capital: $", formatC(final_capital, format = "f", digits = 2, big.mark = ","), "\n"))
+  cat(paste0("Total Return: ", round(total_return, 2), "%\n"))
+  cat(paste0("Annualized Return: ", round(annualized_return_val, 2), "%\n"))
+  cat(paste0("Max Drawdown: ", round(max_drawdown_val, 2), "%\n"))
+  cat(paste0("Sharpe Ratio (Annualized, Rf=0): ", round(sharpe_ratio_val, 2), "\n"))
+  cat(paste0("Buy and Hold Return: ", round(buy_and_hold_return, 2), "%\n"))
+  cat(paste0("Volatility Threshold (used): ", formatC(volatility_threshold, format = "f", digits = 6), "\n"))
+
+  # --- Plotting ---
+  # Plot 1: Portfolio Performance
+  p1 <- ggplot(portfolio, aes(x = hour_timestamp)) +
+    geom_line(aes(y = total, color = "Strategy Portfolio Value")) +
+    geom_line(aes(y = (df_strategy$close / df_strategy$close[1]) * initial_capital, color = "Buy and Hold (Normalized)"), linetype = "dashed") +
+    labs(title = paste0('Portfolio Performance for ', target_asset, ' (SMA Crossover with Volatility Filter)'),
+         x = 'Date',
+         y = 'Portfolio Value (USD)',
+         color = "Legend") +
+    theme_minimal() +
+    theme(plot.title = element_text(hjust = 0.5))
+  ggsave(file.path(OUTPUT_DIR, paste0(target_asset, '_portfolio_performance.png')), plot = p1, width = 14, height = 8)
+  print(p1)
+
+  # Plot 2: Price with SMAs and Trading Signals
+  plot_data <- df_strategy %>%
+    mutate(
+      Buy_Signal = ifelse(Trade_Action == 1, close, NA),
+      Sell_Signal = ifelse(Trade_Action == -1, close, NA)
+    )
+
+  p2 <- ggplot(plot_data, aes(x = hour_timestamp)) +
+    geom_line(aes(y = close, color = "Close Price"), alpha = 0.7) +
+    geom_line(aes(y = SMA_Short, color = paste0('SMA ', SHORT_SMA_PERIOD)), linetype = "solid") +
+    geom_line(aes(y = SMA_Long, color = paste0('SMA ', LONG_SMA_PERIOD)), linetype = "solid") +
+    geom_point(aes(y = Buy_Signal, color = "BUY Signal"), shape = 24, size = 3, fill = "green", na.rm = TRUE) + # Triangle up
+    geom_point(aes(y = Sell_Signal, color = "SELL Signal"), shape = 25, size = 3, fill = "red", na.rm = TRUE) + # Triangle down
+    labs(title = paste0('Price, SMAs, and Trading Signals for ', target_asset),
+         x = 'Date',
+         y = 'Price (USD)',
+         color = "Legend") +
+    theme_minimal() +
+    theme(plot.title = element_text(hjust = 0.5)) +
+    scale_color_manual(values = c("Close Price" = "grey", paste0('SMA ', SHORT_SMA_PERIOD) = "orange", paste0('SMA ', LONG_SMA_PERIOD) = "purple",
+                                  "BUY Signal" = "green", "SELL Signal" = "red"))
+  ggsave(file.path(OUTPUT_DIR, paste0(target_asset, '_price_signals.png')), plot = p2, width = 14, height = 8)
+  print(p2)
+
+  # Plot 3: Hourly Volatility with Threshold
+  p3 <- ggplot(df_strategy, aes(x = hour_timestamp)) +
+    geom_line(aes(y = Volatility, color = "Hourly Volatility (Rolling Std Dev)")) +
+    geom_hline(yintercept = volatility_threshold, linetype = "dashed", color = "red", aes(color = "Volatility Threshold")) +
+    labs(title = paste0('Hourly Volatility for ', target_asset, ' with Threshold'),
+         x = 'Date',
+         y = 'Volatility (Std Dev of Returns)',
+         color = "Legend") +
+    theme_minimal() +
+    theme(plot.title = element_text(hjust = 0.5)) +
+    scale_color_manual(values = c("Hourly Volatility (Rolling Std Dev)" = "steelblue", "Volatility Threshold" = "red"))
+  ggsave(file.path(OUTPUT_DIR, paste0(target_asset, '_volatility.png')), plot = p3, width = 14, height = 6)
+  print(p3)
+}
+
+# --- Main Execution ---
+if (interactive()) {
+  tryCatch({
+    # Load data for the target asset
+    df_asset <- load_and_preprocess_data(DATA_DIR, TARGET_ASSET)
+    cat(paste0("Loaded ", nrow(df_asset), " data points for ", TARGET_ASSET, " from ", min(df_asset$hour_timestamp), " to ", max(df_asset$hour_timestamp), "\n"))
+
+    # Implement strategy logic
+    strategy_results <- implement_strategy(df_asset, SHORT_SMA_PERIOD, LONG_SMA_PERIOD, VOLATILITY_LOOKBACK, VOLATILITY_THRESHOLD_PERCENTILE)
+    df_strategy <- strategy_results$df_strategy
+    actual_vol_threshold <- strategy_results$volatility_threshold
+
+    # Run backtest
+    portfolio_results <- run_backtest(df_strategy, INITIAL_CAPITAL, TRANSACTION_FEE_PERCENT, STOP_LOSS_PERCENT)
+
+    # Analyze and plot results
+    analyze_results(portfolio_results, df_strategy, INITIAL_CAPITAL, actual_vol_threshold, TARGET_ASSET)
+
+  }, error = function(e) {
+    message(paste0("An error occurred: ", e$message))
+    message("Please ensure the data files from the provided link are downloaded and placed in a 'pricedata' directory next to this script.")
+  })
+}
